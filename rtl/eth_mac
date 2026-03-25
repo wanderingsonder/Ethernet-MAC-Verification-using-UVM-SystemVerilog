@@ -1,0 +1,318 @@
+// ============================================================================
+// Module  : eth_mac
+// Description : Ethernet MAC (IEEE 802.3) - TX and RX paths over GMII
+//
+// TX Path:
+//   - Accepts raw frame data (dst, src, type, payload)
+//   - Inserts Preamble (7 x 0x55) + SFD (0xD5)
+//   - Appends CRC-32
+//   - Enforces 12-byte Inter-Frame Gap (IFG)
+//
+// RX Path:
+//   - Detects preamble and SFD
+//   - Captures incoming frame bytes
+//   - Validates CRC — asserts rx_crc_err if bad
+//   - Strips preamble/SFD/CRC before presenting data
+// ============================================================================
+
+module eth_mac (
+   // Clock and Reset
+   input  logic        gtx_clk,
+   input  logic        rst_n,
+
+   // ── TX GMII (MAC → PHY) ──────────────────────────────────────────────────
+   output logic        tx_en,
+   output logic        tx_er,
+   output logic [7:0]  txd,
+
+   // ── RX GMII (PHY → MAC) ──────────────────────────────────────────────────
+   input  logic        rx_clk,
+   input  logic        rx_dv,
+   input  logic        rx_er,
+   input  logic [7:0]  rxd,
+
+   // ── TX User Interface ─────────────────────────────────────────────────────
+   input  logic        tx_valid,       // user asserts to start a frame
+   input  logic [47:0] tx_dst_addr,
+   input  logic [47:0] tx_src_addr,
+   input  logic [15:0] tx_eth_type,
+   input  logic [7:0]  tx_payload,
+   input  logic        tx_payload_valid,
+   input  logic        tx_payload_last,
+   output logic        tx_ready,       // MAC ready for next payload byte
+
+   // ── RX User Interface ─────────────────────────────────────────────────────
+   output logic        rx_valid,       // frame byte available
+   output logic [7:0]  rx_data,        // received byte (stripped of pre/SFD/CRC)
+   output logic        rx_last,        // last byte of frame
+   output logic        rx_crc_err      // CRC mismatch flag
+);
+
+   // =========================================================================
+   // TX State Machine
+   // =========================================================================
+   typedef enum logic [3:0] {
+      TX_IDLE,
+      TX_PREAMBLE,
+      TX_SFD,
+      TX_DST_ADDR,
+      TX_SRC_ADDR,
+      TX_ETH_TYPE,
+      TX_PAYLOAD,
+      TX_CRC,
+      TX_IFG
+   } tx_state_t;
+
+   tx_state_t tx_state;
+
+   localparam PREAMBLE_LEN = 7;
+   localparam IFG_LEN      = 12;
+
+   logic [3:0]  tx_byte_cnt;
+   logic [3:0]  tx_ifg_cnt;
+   logic [47:0] tx_dst_r, tx_src_r;
+   logic [15:0] tx_type_r;
+   logic [2:0]  tx_crc_cnt;
+   logic [31:0] tx_crc_reg;
+   logic [31:0] tx_crc_out;
+
+   // CRC update function (one byte at a time)
+   function automatic logic [31:0] crc32_byte (
+      input logic [31:0] crc_in,
+      input logic [7:0]  data
+   );
+      logic [31:0] c;
+      c = crc_in ^ {24'h0, data};
+      for (int i = 0; i < 8; i++) begin
+         if (c[0]) c = (c >> 1) ^ 32'hEDB88320;
+         else      c = c >> 1;
+      end
+      return c;
+   endfunction
+
+   always_ff @(posedge gtx_clk or negedge rst_n) begin
+      if (!rst_n) begin
+         tx_state    <= TX_IDLE;
+         tx_en       <= 1'b0;
+         tx_er       <= 1'b0;
+         txd         <= 8'h00;
+         tx_ready    <= 1'b0;
+         tx_byte_cnt <= '0;
+         tx_ifg_cnt  <= '0;
+         tx_crc_cnt  <= '0;
+         tx_crc_reg  <= 32'hFFFFFFFF;
+      end else begin
+         case (tx_state)
+
+            // ── Wait for user to assert tx_valid ──────────────────────────
+            TX_IDLE: begin
+               tx_en      <= 1'b0;
+               tx_er      <= 1'b0;
+               txd        <= 8'h00;
+               tx_ready   <= 1'b0;
+               tx_crc_reg <= 32'hFFFFFFFF;
+               if (tx_valid) begin
+                  tx_dst_r    <= tx_dst_addr;
+                  tx_src_r    <= tx_src_addr;
+                  tx_type_r   <= tx_eth_type;
+                  tx_byte_cnt <= 4'd0;
+                  tx_state    <= TX_PREAMBLE;
+               end
+            end
+
+            // ── 7 bytes of 0x55 ───────────────────────────────────────────
+            TX_PREAMBLE: begin
+               tx_en <= 1'b1;
+               txd   <= 8'h55;
+               if (tx_byte_cnt == PREAMBLE_LEN - 1) begin
+                  tx_byte_cnt <= 4'd0;
+                  tx_state    <= TX_SFD;
+               end else begin
+                  tx_byte_cnt <= tx_byte_cnt + 1;
+               end
+            end
+
+            // ── 1 byte SFD 0xD5 ───────────────────────────────────────────
+            TX_SFD: begin
+               txd         <= 8'hD5;
+               tx_byte_cnt <= 4'd5;   // dst addr starts at byte 5 (MSB)
+               tx_state    <= TX_DST_ADDR;
+            end
+
+            // ── 6 bytes Destination Address (MSB first) ───────────────────
+            TX_DST_ADDR: begin
+               txd        <= tx_dst_r[tx_byte_cnt*8 +: 8];
+               tx_crc_reg <= crc32_byte(tx_crc_reg, tx_dst_r[tx_byte_cnt*8 +: 8]);
+               if (tx_byte_cnt == 0) begin
+                  tx_byte_cnt <= 4'd5;
+                  tx_state    <= TX_SRC_ADDR;
+               end else begin
+                  tx_byte_cnt <= tx_byte_cnt - 1;
+               end
+            end
+
+            // ── 6 bytes Source Address (MSB first) ────────────────────────
+            TX_SRC_ADDR: begin
+               txd        <= tx_src_r[tx_byte_cnt*8 +: 8];
+               tx_crc_reg <= crc32_byte(tx_crc_reg, tx_src_r[tx_byte_cnt*8 +: 8]);
+               if (tx_byte_cnt == 0) begin
+                  tx_byte_cnt <= 4'd1;
+                  tx_state    <= TX_ETH_TYPE;
+               end else begin
+                  tx_byte_cnt <= tx_byte_cnt - 1;
+               end
+            end
+
+            // ── 2 bytes EtherType ─────────────────────────────────────────
+            TX_ETH_TYPE: begin
+               txd        <= tx_type_r[tx_byte_cnt*8 +: 8];
+               tx_crc_reg <= crc32_byte(tx_crc_reg, tx_type_r[tx_byte_cnt*8 +: 8]);
+               if (tx_byte_cnt == 0) begin
+                  tx_ready <= 1'b1;
+                  tx_state <= TX_PAYLOAD;
+               end else begin
+                  tx_byte_cnt <= tx_byte_cnt - 1;
+               end
+            end
+
+            // ── Payload bytes (user driven) ───────────────────────────────
+            TX_PAYLOAD: begin
+               if (tx_payload_valid) begin
+                  txd        <= tx_payload;
+                  tx_crc_reg <= crc32_byte(tx_crc_reg, tx_payload);
+                  if (tx_payload_last) begin
+                     tx_ready    <= 1'b0;
+                     tx_crc_out  <= ~tx_crc_reg; // finalise CRC
+                     tx_crc_cnt  <= 3'd0;
+                     tx_state    <= TX_CRC;
+                  end
+               end
+            end
+
+            // ── 4 bytes CRC (LSB first) ───────────────────────────────────
+            TX_CRC: begin
+               txd <= tx_crc_out[7:0];
+               tx_crc_out <= tx_crc_out >> 8;
+               if (tx_crc_cnt == 3'd3) begin
+                  tx_en      <= 1'b0;
+                  txd        <= 8'h00;
+                  tx_ifg_cnt <= 4'd0;
+                  tx_state   <= TX_IFG;
+               end else begin
+                  tx_crc_cnt <= tx_crc_cnt + 1;
+               end
+            end
+
+            // ── 12 idle cycles (Inter-Frame Gap) ─────────────────────────
+            TX_IFG: begin
+               txd <= 8'h00;
+               if (tx_ifg_cnt == IFG_LEN - 1) begin
+                  tx_state <= TX_IDLE;
+               end else begin
+                  tx_ifg_cnt <= tx_ifg_cnt + 1;
+               end
+            end
+
+            default: tx_state <= TX_IDLE;
+
+         endcase
+      end
+   end
+
+   // =========================================================================
+   // RX State Machine
+   // =========================================================================
+   typedef enum logic [2:0] {
+      RX_IDLE,
+      RX_PREAMBLE,
+      RX_DATA,
+      RX_CRC_CHECK
+   } rx_state_t;
+
+   rx_state_t rx_state;
+
+   logic [31:0] rx_crc_reg;
+   logic [31:0] rx_crc_captured;
+   logic [7:0]  rx_pipe [0:3];    // 4-byte delay pipeline (to strip CRC)
+   logic        rx_pipe_valid [0:3];
+   logic        rx_pipe_last;
+   int          rx_byte_cnt;
+
+   always_ff @(posedge rx_clk or negedge rst_n) begin
+      if (!rst_n) begin
+         rx_state       <= RX_IDLE;
+         rx_valid       <= 1'b0;
+         rx_data        <= 8'h00;
+         rx_last        <= 1'b0;
+         rx_crc_err     <= 1'b0;
+         rx_crc_reg     <= 32'hFFFFFFFF;
+         rx_byte_cnt    <= 0;
+         rx_pipe_valid  <= '{default: 1'b0};
+      end else begin
+         rx_valid   <= 1'b0;
+         rx_last    <= 1'b0;
+         rx_crc_err <= 1'b0;
+
+         case (rx_state)
+
+            // ── Wait for rx_dv ────────────────────────────────────────────
+            RX_IDLE: begin
+               rx_crc_reg  <= 32'hFFFFFFFF;
+               rx_byte_cnt <= 0;
+               if (rx_dv)
+                  rx_state <= RX_PREAMBLE;
+            end
+
+            // ── Skip preamble (0x55) and detect SFD (0xD5) ───────────────
+            RX_PREAMBLE: begin
+               if (!rx_dv) begin
+                  rx_state <= RX_IDLE;
+               end else if (rxd == 8'hD5) begin
+                  rx_state <= RX_DATA;
+               end
+            end
+
+            // ── Capture data bytes; use 4-byte pipeline to strip CRC ──────
+            RX_DATA: begin
+               if (!rx_dv) begin
+                  // End of frame — last 4 pipe bytes are the received CRC
+                  rx_crc_captured <= {rx_pipe[3], rx_pipe[2], rx_pipe[1], rx_pipe[0]};
+                  rx_state        <= RX_CRC_CHECK;
+               end else begin
+                  // Push new byte into pipeline
+                  rx_pipe[0] <= rxd;
+                  rx_pipe[1] <= rx_pipe[0];
+                  rx_pipe[2] <= rx_pipe[1];
+                  rx_pipe[3] <= rx_pipe[2];
+
+                  rx_pipe_valid[0] <= 1'b1;
+                  rx_pipe_valid[1] <= rx_pipe_valid[0];
+                  rx_pipe_valid[2] <= rx_pipe_valid[1];
+                  rx_pipe_valid[3] <= rx_pipe_valid[2];
+
+                  // Output the byte that is 4 positions old (pre-CRC data)
+                  if (rx_pipe_valid[3]) begin
+                     rx_valid <= 1'b1;
+                     rx_data  <= rx_pipe[3];
+                     // Update running CRC on this output byte
+                     rx_crc_reg <= crc32_byte(rx_crc_reg, rx_pipe[3]);
+                  end
+               end
+            end
+
+            // ── Compare computed CRC vs received CRC ──────────────────────
+            RX_CRC_CHECK: begin
+               rx_last <= 1'b1;
+               if ((~rx_crc_reg) !== rx_crc_captured)
+                  rx_crc_err <= 1'b1;
+               rx_pipe_valid <= '{default: 1'b0};
+               rx_state      <= RX_IDLE;
+            end
+
+            default: rx_state <= RX_IDLE;
+
+         endcase
+      end
+   end
+
+endmodule
