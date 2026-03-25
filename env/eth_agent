@@ -1,0 +1,31 @@
+class eth_agent extends uvm_agent;
+
+   `uvm_component_utils(eth_agent)
+
+   virtual eth_interface vif;
+   eth_driver    m_driver;
+   eth_sequencer m_sequencer;
+   eth_monitor   m_monitor;
+
+   function new(string name = "eth_agent", uvm_component parent = null);
+      super.new(name, parent);
+   endfunction: new
+
+   virtual function void build_phase(uvm_phase phase);
+      super.build_phase(phase);
+      m_monitor   = eth_monitor::type_id::create("m_monitor",   this);
+      m_driver    = eth_driver::type_id::create("m_driver",     this);
+      m_sequencer = eth_sequencer::type_id::create("m_sequencer", this);
+
+      if(!uvm_config_db #(virtual eth_interface)::get(this, "", "vif", vif))
+         `uvm_fatal(get_full_name(), {"virtual interface must be set for: ", ".vif"})
+   endfunction: build_phase
+
+   function void connect_phase(uvm_phase phase);
+      super.connect_phase(phase);
+      m_driver.seq_item_port.connect(m_sequencer.seq_item_export);
+      m_driver.vif  = vif;
+      m_monitor.vif = vif;
+   endfunction
+
+endclass
